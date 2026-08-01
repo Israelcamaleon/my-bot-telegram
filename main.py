@@ -13,6 +13,9 @@ ODOO_DB = os.environ["ODOO_DB"]
 ODOO_USER = os.environ["ODOO_USER"]
 ODOO_PASS = os.environ["ODOO_PASS"]
 
+# México (Querétaro/CDMX): UTC-6 todo el año (sin horario de verano)
+UTC_OFFSET = 6
+
 client = OpenAI(api_key=KIMI_API_KEY, base_url="https://api.moonshot.ai/v1")
 historial = {}
 
@@ -28,6 +31,10 @@ def odoo_uid():
 def odoo(model, method, args, kwargs=None):
     models = xmlrpc.client.ServerProxy(f"{ODOO_URL}/xmlrpc/2/object")
     return models.execute_kw(ODOO_DB, odoo_uid(), ODOO_PASS, model, method, args, kwargs or {})
+
+def ahora_mx():
+    # Hora local de México a partir del reloj UTC del servidor
+    return datetime.utcnow() - timedelta(hours=UTC_OFFSET)
 
 def consultar_inventario(termino):
     prods = odoo("product.product", "search_read",
@@ -47,7 +54,7 @@ def consultar_inventario(termino):
 
 def resolver_fecha(texto):
     texto = (texto or "").strip().lower()
-    hoy = datetime.now().date()
+    hoy = ahora_mx().date()
     if texto in ("", "hoy"):
         return hoy, "hoy"
     if texto == "ayer":
@@ -62,8 +69,10 @@ def corte_ventas(sucursal="", fecha_txt=""):
     if fecha is None:
         return f"❌ No entendí la fecha '{fecha_txt}'. Usa: hoy, ayer o AAAA-MM-DD."
     dia = fecha.strftime("%Y-%m-%d")
-    domain = [["date_order", ">=", dia + " 00:00:00"],
-              ["date_order", "<=", dia + " 23:59:59"],
+    dia_sig = (fecha + timedelta(days=1)).strftime("%Y-%m-%d")
+    # Día local México en términos UTC: de dia 06:00 a dia_sig 06:00
+    domain = [["date_order", ">=", dia + " 06:00:00"],
+              ["date_order", "<", dia_sig + " 06:00:00"],
               ["state", "in", ["paid", "done", "invoiced"]]]
     if sucursal:
         domain.append(["session_id.config_id.name", "ilike", sucursal])
@@ -74,7 +83,6 @@ def corte_ventas(sucursal="", fecha_txt=""):
         return f"📊 Sin ventas registradas{donde} ({etiqueta}, {dia})."
     total = sum(o["amount_total"] for o in orders)
 
-    # Si no pidieron sucursal específica, desglosar por sucursal
     if not sucursal:
         sesiones_ids = list({o["session_id"][0] for o in orders if o.get("session_id")})
         sesiones = odoo("pos.session", "search_read",
@@ -158,7 +166,7 @@ Usuario: "cuántos tintes Hidracolor hay" → BUSCAR: Hidracolor
 Usuario: "usé 1 tinte 4.52" → MOVI: 1 | Hidracolor 4.52 |
 Usuario: "búscame al cliente María" → CLIENTE: María
 
-NUNCA inventes datos de Odoo. NUNCA digas "no tengo acceso": SÍ tienes acceso vía comandos. Si la pregunta menciona ventas, inventario, productos o clientes, SIEMPRE emite el comando. Cuando pidan total Y desglose por sucursal, usa CORTE con sucursal vacía (el sistema ya desglosa solo).
+NUNCA inventes datos de Odoo. NUNCA digas "no tengo acceso": SÍ tienes acceso vía comandos. Si la pregunta menciona ventas, inventario, productos o clientes, SIEMPRE emite el comando. Cuando pidan total Y desglose por sucursal, usa CORTE con sucursal vacía (el sistema desglosa solo).
 
 REGLA #2 — AGENDA:
 Eres el índice de pendientes de Israel. Cuando pregunte "qué tengo pendiente", clasifica y lista por proyecto.
