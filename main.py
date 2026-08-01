@@ -91,7 +91,7 @@ def corte_ventas(sucursal="", fecha_txt=""):
         mapa = {s["id"]: s["config_id"][1] for s in sesiones if s.get("config_id")}
         por_suc = {}
         for o in orders:
-            nombre_suc = mapa.get(o["session_id"][0], "Otra") if o.get("session_id") else "Otra"
+            nombre_suc = (mapa.get(o["session_id"][0], "Otra") if o.get("session_id") else "Otra").replace(" (no usado)", "")
             t, m = por_suc.get(nombre_suc, (0, 0.0))
             por_suc[nombre_suc] = (t + 1, m + o["amount_total"])
         lineas = [f"📊 Ventas de {etiqueta} ({dia}) — TODAS las sucursales:"]
