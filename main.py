@@ -305,3 +305,4 @@ app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, mensaje))
 app.run_polling()
 
 
+
