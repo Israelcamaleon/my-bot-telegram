@@ -1,6 +1,7 @@
 import os
+import asyncio
 import xmlrpc.client
-from datetime import datetime
+from datetime import datetime, timedelta
 from openai import OpenAI
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, ContextTypes, filters
@@ -33,7 +34,7 @@ def consultar_inventario(termino):
                  [[["name", "ilike", termino]]],
                  {"fields": ["id", "name", "default_code"], "limit": 10})
     if not prods:
-        return f"No encontré productos con '{termino}'."
+        return f"❌ No encontré productos con '{termino}'."
     lineas = []
     for p in prods:
         grupos = odoo("stock.quant", "read_group",
@@ -41,31 +42,67 @@ def consultar_inventario(termino):
                       {"fields": ["qty", "location_id"], "groupby": ["location_id"]})
         total = sum(g["qty"] for g in grupos)
         detalle = ", ".join(f"{g['location_id'][1]}: {g['qty']:.0f}" for g in grupos if g["qty"] != 0)
-        lineas.append(f"{p['name']} — Total: {total:.0f}" + (f" ({detalle})" if detalle else ""))
+        lineas.append(f"📦 {p['name']} — Total: {total:.0f}" + (f"\n   ({detalle})" if detalle else ""))
     return "\n".join(lineas)
 
-def corte_del_dia(sucursal=""):
-    hoy = datetime.now().strftime("%Y-%m-%d")
-    domain = [["date_order", ">=", hoy + " 00:00:00"],
+def resolver_fecha(texto):
+    texto = (texto or "").strip().lower()
+    hoy = datetime.now().date()
+    if texto in ("", "hoy"):
+        return hoy, "hoy"
+    if texto == "ayer":
+        return hoy - timedelta(days=1), "ayer"
+    try:
+        return datetime.strptime(texto, "%Y-%m-%d").date(), texto
+    except ValueError:
+        return None, None
+
+def corte_ventas(sucursal="", fecha_txt=""):
+    fecha, etiqueta = resolver_fecha(fecha_txt)
+    if fecha is None:
+        return f"❌ No entendí la fecha '{fecha_txt}'. Usa: hoy, ayer o AAAA-MM-DD."
+    dia = fecha.strftime("%Y-%m-%d")
+    domain = [["date_order", ">=", dia + " 00:00:00"],
+              ["date_order", "<=", dia + " 23:59:59"],
               ["state", "in", ["paid", "done", "invoiced"]]]
     if sucursal:
         domain.append(["session_id.config_id.name", "ilike", sucursal])
     orders = odoo("pos.order", "search_read", [domain],
-                  {"fields": ["name", "amount_total", "session_id"], "limit": 200})
+                  {"fields": ["name", "amount_total", "session_id"], "limit": 500})
+    donde = f" en {sucursal}" if sucursal else ""
     if not orders:
-        return "No hay ventas registradas hoy" + (f" en {sucursal}." if sucursal else ".")
+        return f"📊 Sin ventas registradas{donde} ({etiqueta}, {dia})."
     total = sum(o["amount_total"] for o in orders)
-    return f"Ventas de hoy{(' en ' + sucursal) if sucursal else ''}: {len(orders)} tickets, total ${total:,.2f} MXN."
+
+    # Si no pidieron sucursal específica, desglosar por sucursal
+    if not sucursal:
+        sesiones_ids = list({o["session_id"][0] for o in orders if o.get("session_id")})
+        sesiones = odoo("pos.session", "search_read",
+                        [[["id", "in", sesiones_ids]]],
+                        {"fields": ["id", "config_id"]})
+        mapa = {s["id"]: s["config_id"][1] for s in sesiones if s.get("config_id")}
+        por_suc = {}
+        for o in orders:
+            nombre_suc = mapa.get(o["session_id"][0], "Otra") if o.get("session_id") else "Otra"
+            t, m = por_suc.get(nombre_suc, (0, 0.0))
+            por_suc[nombre_suc] = (t + 1, m + o["amount_total"])
+        lineas = [f"📊 Ventas de {etiqueta} ({dia}) — TODAS las sucursales:"]
+        for nombre_suc, (t, m) in sorted(por_suc.items()):
+            lineas.append(f"🏪 {nombre_suc}: {t} tickets — ${m:,.2f}")
+        lineas.append(f"💰 TOTAL: {len(orders)} tickets — ${total:,.2f} MXN")
+        return "\n".join(lineas)
+
+    return f"📊 Ventas de {etiqueta} ({dia}){donde}:\n🧾 {len(orders)} tickets\n💰 Total: ${total:,.2f} MXN"
 
 def registrar_movimiento(cantidad, producto, sucursal=""):
     prods = odoo("product.product", "search_read",
                  [[["name", "ilike", producto]]],
                  {"fields": ["id", "name", "uom_id"], "limit": 5})
     if not prods:
-        return f"No encontré el producto '{producto}'."
+        return f"❌ No encontré el producto '{producto}'."
     if len(prods) > 1:
         nombres = ", ".join(p["name"] for p in prods)
-        return f"Encontré varios productos: {nombres}. Sé más específico."
+        return f"⚠️ Encontré varios: {nombres}. Sé más específico."
     p = prods[0]
     dom_src = [["usage", "=", "internal"]]
     if sucursal:
@@ -78,7 +115,7 @@ def registrar_movimiento(cantidad, producto, sucursal=""):
                [[["usage", "=", "inventory"]]],
                {"fields": ["id", "complete_name"], "limit": 1})
     if not src or not dst:
-        return "No encontré las ubicaciones de origen/destino en Odoo."
+        return "❌ No encontré las ubicaciones de origen/destino en Odoo."
     move_id = odoo("stock.move", "create", [{
         "name": f"Uso en cabina: {p['name']}",
         "product_id": p["id"],
@@ -88,16 +125,16 @@ def registrar_movimiento(cantidad, producto, sucursal=""):
         "location_dest_id": dst[0]["id"],
     }])
     odoo("stock.move", "action_done", [[move_id]])
-    return f"Listo: desconté {cantidad} de '{p['name']}' desde {src[0]['complete_name']}."
+    return f"✅ Desconté {cantidad} de '{p['name']}' desde {src[0]['complete_name']}."
 
 def buscar_cliente(nombre):
     partners = odoo("res.partner", "search_read",
                     [[["name", "ilike", nombre], ["customer", "=", True]]],
-                    {"fields": ["name", "phone", "mobile", "email"], "limit": 5})
+                    {"fields": ["name", "phone", "mobile"], "limit": 5})
     if not partners:
-        return f"No encontré clientes con '{nombre}'."
-    return "\n".join(
-        f"{c['name']} — Tel: {c.get('phone') or c.get('mobile') or 'sin teléfono'}"
+        return f"❌ No encontré clientes con '{nombre}'."
+    return "👤 Clientes:\n" + "\n".join(
+        f"• {c['name']} — {c.get('phone') or c.get('mobile') or 'sin teléfono'}"
         for c in partners)
 
 SYSTEM = """Eres el agente personal de Israel Becerril (Salón Alika, sucursales Zaragoza y Juriquilla; barbería CattleDogs; ERP Odoo).
@@ -105,64 +142,51 @@ SYSTEM = """Eres el agente personal de Israel Becerril (Salón Alika, sucursales
 REGLA #1 — COMANDOS ODOO (TIENE PRIORIDAD SOBRE TODO):
 Cuando el usuario pida datos de Odoo, NO respondas con texto normal. Responde ÚNICAMENTE con una línea de comando:
 
-- Inventario/existencias de productos → BUSCAR: <termino>
-- Ventas del día, corte, cobros, cuánto vendí → CORTE: <sucursal o vacío>
+- Inventario/existencias → BUSCAR: <termino>
+- Ventas, corte, cobros, cuánto vendí (cualquier día; general o por sucursal) → CORTE: <sucursal o vacío> | <hoy, ayer o AAAA-MM-DD>
 - Registrar uso/salida de producto → MOVI: <cantidad> | <producto> | <sucursal o vacío>
 - Datos de un cliente → CLIENTE: <nombre>
 
-Ejemplos de cómo responder (copia este formato exacto):
-Usuario: "cuánto vendí hoy" → CORTE:
-Usuario: "cuánto vendí hoy en Zaragoza" → CORTE: Zaragoza
-Usuario: "ventas de Juriquilla" → CORTE: Juriquilla
+Ejemplos (copia el formato exacto):
+Usuario: "cuánto vendí hoy" → CORTE: | hoy
+Usuario: "cuánto vendí ayer" → CORTE: | ayer
+Usuario: "cuánto vendí ayer en total y por sucursal" → CORTE: | ayer
+Usuario: "ventas por sucursal de hoy" → CORTE: | hoy
+Usuario: "cuánto vendí ayer en Zaragoza" → CORTE: Zaragoza | ayer
+Usuario: "ventas del 30 de julio" → CORTE: | 2026-07-30
 Usuario: "cuántos tintes Hidracolor hay" → BUSCAR: Hidracolor
-Usuario: "hay shampoo Redken?" → BUSCAR: shampoo Redken
 Usuario: "usé 1 tinte 4.52" → MOVI: 1 | Hidracolor 4.52 |
 Usuario: "búscame al cliente María" → CLIENTE: María
 
-NUNCA inventes datos de Odoo. NUNCA digas "no tengo acceso en tiempo real": SÍ tienes acceso vía comandos. Si la pregunta menciona ventas, corte, inventario, productos o clientes, SIEMPRE emite el comando correspondiente.
+NUNCA inventes datos de Odoo. NUNCA digas "no tengo acceso": SÍ tienes acceso vía comandos. Si la pregunta menciona ventas, inventario, productos o clientes, SIEMPRE emite el comando. Cuando pidan total Y desglose por sucursal, usa CORTE con sucursal vacía (el sistema ya desglosa solo).
 
 REGLA #2 — AGENDA:
-Eres el índice de los pendientes de Israel (viene de varios chats de Kimi). Cuando pregunte "qué tengo pendiente", clasifica y lista por proyecto.
+Eres el índice de pendientes de Israel. Cuando pregunte "qué tengo pendiente", clasifica y lista por proyecto.
 
-Sistema del salón (tareas de la nota, en orden):
-1. Categorías
-2. Catálogo de productos
-3. Precios y costos
-4. Catálogo de servicios
-5. Clientes
-6. Reglas de comisiones
-7. Cliente frecuente
-8. Ficha en el sistema
-9. Videos
-10. Capacitación de recepción
+Sistema del salón (en orden): 1. Categorías 2. Catálogo de productos 3. Precios y costos 4. Catálogo de servicios 5. Clientes 6. Reglas de comisiones 7. Cliente frecuente 8. Ficha en el sistema 9. Videos 10. Capacitación de recepción.
 
-Odoo: terminar inventario de tintes sucursal Zaragoza; poner en cero tintes Terranova.
+Odoo: terminar inventario de tintes Zaragoza; poner en cero tintes Terranova.
 
-Pendientes personales:
-- Firma de contrato de alquiler ($9,000 + $750 mantenimiento)
-- Revisar con el perito los faltantes
-- Revisar carta del perito (Claude está redactándola)
-- Internet casa: prueba en fast.com y comprar sistema mesh
-- TikTok: primer video editado en CapCut
-- App: estados de cuenta (parser Nu)
-- App: inventario de químicos
+Pendientes personales: firma de contrato de alquiler ($9,000 + $750 mantenimiento); revisar con perito los faltantes; revisar carta del perito (la redacta Claude); internet casa (prueba fast.com + comprar mesh); TikTok (primer video en CapCut); app estados de cuenta (parser Nu); app inventario de químicos.
 
-Proyecto bot: Telegram @MiAgenteKimi2026_bot conectado a esta agenda y a Odoo. Después: segundo agente dentro de la app de citas y pasarela de pagos.
+Proyecto bot: Telegram @MiAgenteKimi2026_bot conectado a agenda y Odoo. Después: agente en app de citas y pasarela de pagos.
 
-Responde en español, directo y conciso, como asistente personal. Cuando te pregunten algo fuera de Odoo, responde normal."""
+Responde en español, directo y conciso. Si la pregunta es fuera de Odoo, responde normal."""
 
 def ejecutar_comando(texto):
-    t = texto.strip()
-    for linea in t.splitlines():
+    for linea in texto.strip().splitlines():
         linea = linea.strip()
         if linea.upper().startswith("BUSCAR:"):
             return consultar_inventario(linea.split(":", 1)[1].strip())
         if linea.upper().startswith("CORTE:"):
-            return corte_del_dia(linea.split(":", 1)[1].strip())
+            partes = [x.strip() for x in linea.split(":", 1)[1].split("|")]
+            sucursal = partes[0] if partes else ""
+            fecha = partes[1] if len(partes) > 1 and partes[1] else "hoy"
+            return corte_ventas(sucursal, fecha)
         if linea.upper().startswith("MOVI:"):
             partes = [x.strip() for x in linea.split(":", 1)[1].split("|")]
             if len(partes) < 2:
-                return "Formato de movimiento incompleto."
+                return "⚠️ Formato de movimiento incompleto."
             return registrar_movimiento(partes[0], partes[1], partes[2] if len(partes) > 2 else "")
         if linea.upper().startswith("CLIENTE:"):
             return buscar_cliente(linea.split(":", 1)[1].strip())
@@ -171,15 +195,13 @@ def ejecutar_comando(texto):
 def responder(chat_id, texto_usuario):
     msgs = historial.setdefault(chat_id, [{"role": "system", "content": SYSTEM}])
     msgs.append({"role": "user", "content": texto_usuario})
-    r = client.chat.completions.create(model="kimi-k2.6", messages=msgs[-21:])
+    r = client.chat.completions.create(model="kimi-k2.6", messages=msgs[-11:])
     contenido = r.choices[0].message.content
-    print("LLM respondió:", contenido)  # visible en logs de Railway
+    print("LLM respondió:", contenido)
     resultado = ejecutar_comando(contenido)
     if resultado is not None:
         msgs.append({"role": "assistant", "content": contenido})
-        msgs.append({"role": "user", "content": f"[Resultado de Odoo]\n{resultado}\n\nAhora respóndeme con estos datos, breve y claro."})
-        r2 = client.chat.completions.create(model="kimi-k2.6", messages=msgs[-21:])
-        contenido = r2.choices[0].message.content
+        return resultado
     msgs.append({"role": "assistant", "content": contenido})
     return contenido
 
@@ -188,11 +210,12 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def mensaje(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
+    aviso = await update.message.reply_text("⏳ Consultando...")
     try:
-        respuesta = responder(chat_id, update.message.text)
+        respuesta = await asyncio.to_thread(responder, chat_id, update.message.text)
     except Exception as e:
-        respuesta = f"Error al consultar: {e}"
-    await update.message.reply_text(respuesta)
+        respuesta = f"❌ Error al consultar: {e}"
+    await aviso.edit_text(respuesta)
 
 app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
 app.add_handler(CommandHandler("start", start))
