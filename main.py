@@ -1,32 +1,67 @@
 import os
+import xmlrpc.client
 from openai import OpenAI
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters, ContextTypes
 
 TELEGRAM_TOKEN = os.environ["TELEGRAM_TOKEN"]
 KIMI_API_KEY = os.environ["KIMI_API_KEY"]
+ODOO_URL = os.environ["ODOO_URL"]
+ODOO_DB = os.environ["ODOO_DB"]
+ODOO_USER = os.environ["ODOO_USER"]
+ODOO_PASS = os.environ["ODOO_PASS"]
 
 client = OpenAI(api_key=KIMI_API_KEY, base_url="https://api.moonshot.ai/v1")
+
+common = xmlrpc.client.ServerProxy(f"{ODOO_URL}/xmlrpc/2/common", allow_none=True)
+models = xmlrpc.client.ServerProxy(f"{ODOO_URL}/xmlrpc/2/object", allow_none=True)
+_uid = {}
+
+def odoo_uid():
+    if "uid" not in _uid:
+        _uid["uid"] = common.authenticate(ODOO_DB, ODOO_USER, ODOO_PASS, {})
+    return _uid["uid"]
+
+def odoo(model, method, args, kwargs=None):
+    return models.execute_kw(ODOO_DB, odoo_uid(), ODOO_PASS, model, method, args, kwargs or {})
+
+def consultar_inventario(termino):
+    prods = odoo("product.product", "search_read",
+                 [[["name", "ilike", termino]]],
+                 {"fields": ["name", "qty_available"], "limit": 10})
+    if not prods:
+        return f"No encontre productos con: {termino}"
+    lineas = []
+    for p in prods:
+        grupos = odoo("stock.quant", "read_group",
+                      [[["product_id", "=", p["id"]], ["qty", ">", 0]],
+                       ["qty", "location_id"], ["location_id"]])
+        detalle = ", ".join(f"{g['location_id'][1]}: {g['qty']:g}" for g in grupos) or "sin existencias"
+        lineas.append(f"{p['name']} | total {p['qty_available']:g} | {detalle}")
+    return "\n".join(lineas)
 
 SYSTEM = """Eres el agente personal de Israel Becerril. Respondes en espanol, claro y directo.
 
 SUS NEGOCIOS:
 - Salon de belleza Alika (sucursales Juriquilla y Zaragoza; Terranova cerro)
-- Barberia nueva por abrir (nombres en juego: Heeler Studio / CattleDogs)
-- Paginas: alika.com.mx y cattledogs (WordPress en servidor propio)
+- Barberia Cattledogs
+- Paginas: alika.com.mx y cattledogs (WordPress)
 - App de citas: citas-salon.vercel.app
-- ERP: Odoo
+- ERP: Odoo 8 con sucursales Zaragoza, Juriquilla y Terranova
 
 PENDIENTES ACTUALES:
 SISTEMA DEL SALON (en orden): 1) revisar categorias 2) catalogo de productos 3) precios y costos 4) catalogo de servicios 5) clientes 6) reglas de comisiones 7) cliente frecuente 8) ficha en el sistema 9) videos de productos y servicios 10) capacitacion de recepcion.
-ODOO: terminar inventario de tintes Zaragoza (por familias, ej. Redken; fracciones como 1.5 y 1.25 van como texto); verificar que Terranova quedo en 0 y su producto paso a Zaragoza.
-PERSONALES: firma de contrato de alquiler (renta 9000 + 750 mantenimiento); revisar con perito los faltantes; revisar carta del perito (la redacta Claude); internet de la casa (fibra 120 megas, falla planta alta; solucion elegida: sistema mesh TP-Link Deco o Mercusys Halo; pendiente prueba fast.com y compra).
-TIKTOK: editor elegido CapCut gratis; pendiente descargarlo y hacer primer video de prueba; Gemini descartado por ser de paga.
-APP ESTADOS DE CUENTA: BBVA, DiDi e INVEX funcionan; pendiente arreglar parser de Nu (lo detecta como Stori) y clasificacion de gastos por rubro.
-APP INVENTARIO QUIMICOS: pendiente construir app para Android con Google Sheets (ya tiene datos en un Sheet).
-BOT TELEGRAM: TERMINADO (eres tu). Siguientes mejoras: ensenarle agenda (hecho), conectar Odoo, entender fotos y audios, conectar app de citas.
+ODOO: terminar inventario de tintes Zaragoza (por familias; fracciones como 1.5 y 1.25 van como texto); verificar que Terranova quedo en 0 y su producto paso a Zaragoza.
+PERSONALES: firma de contrato de alquiler; revisar con perito los faltantes; revisar carta del perito (la redacta Claude); internet de la casa (prueba fast.com y comprar sistema mesh).
+TIKTOK: descargar CapCut gratis y hacer primer video de prueba.
+APP ESTADOS DE CUENTA: arreglar parser de Nu y clasificacion de gastos por rubro.
+APP INVENTARIO QUIMICOS: construir app Android con Google Sheets.
 
-Cuando Israel te diga que termino algo, confirma y dile que lo tachamos. Cuando pregunte "que pendientes tengo", dale la lista organizada."""
+REGLA ESPECIAL DE INVENTARIO:
+Si el usuario pregunta por inventario, existencias, stock, o cuantos productos/tintes hay de algo, NO inventes la respuesta. Responde UNICAMENTE con:
+BUSCAR: <nombre del producto o familia a buscar>
+Ejemplo: si pregunta "cuantos tintes redken 07T tengo", respondes: BUSCAR: Redken 07T
+Para cualquier otro tema responde normal."""
 
 historial = {}
 
@@ -41,6 +76,16 @@ async def responder(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         r = client.chat.completions.create(model="kimi-k2.6", messages=msgs[-20:])
         respuesta = r.choices[0].message.content
+        if respuesta.strip().upper().startswith("BUSCAR:"):
+            termino = respuesta.split(":", 1)[1].strip()
+            await update.message.reply_text(f"Consultando Odoo: {termino}...")
+            try:
+                datos = consultar_inventario(termino)
+            except Exception as e:
+                datos = f"No pude conectarme a Odoo: {e}"
+            msgs.append({"role": "user", "content": f"Resultados reales del inventario:\n{datos}\n\nRespondeme con estos datos, claro y breve."})
+            r2 = client.chat.completions.create(model="kimi-k2.6", messages=msgs[-20:])
+            respuesta = r2.choices[0].message.content
     except Exception as e:
         respuesta = f"Error: {e}"
     msgs.append({"role": "assistant", "content": respuesta})
