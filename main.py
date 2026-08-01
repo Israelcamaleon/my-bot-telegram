@@ -1,8 +1,9 @@
 import os
 import xmlrpc.client
+from datetime import datetime
 from openai import OpenAI
 from telegram import Update
-from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters, ContextTypes
+from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, ContextTypes, filters
 
 TELEGRAM_TOKEN = os.environ["TELEGRAM_TOKEN"]
 KIMI_API_KEY = os.environ["KIMI_API_KEY"]
@@ -12,87 +13,188 @@ ODOO_USER = os.environ["ODOO_USER"]
 ODOO_PASS = os.environ["ODOO_PASS"]
 
 client = OpenAI(api_key=KIMI_API_KEY, base_url="https://api.moonshot.ai/v1")
+historial = {}
 
-common = xmlrpc.client.ServerProxy(f"{ODOO_URL}/xmlrpc/2/common", allow_none=True)
-models = xmlrpc.client.ServerProxy(f"{ODOO_URL}/xmlrpc/2/object", allow_none=True)
-_uid = {}
+_uid_cache = None
 
 def odoo_uid():
-    if "uid" not in _uid:
-        _uid["uid"] = common.authenticate(ODOO_DB, ODOO_USER, ODOO_PASS, {})
-    return _uid["uid"]
+    global _uid_cache
+    if _uid_cache is None:
+        common = xmlrpc.client.ServerProxy(f"{ODOO_URL}/xmlrpc/2/common")
+        _uid_cache = common.authenticate(ODOO_DB, ODOO_USER, ODOO_PASS, {})
+    return _uid_cache
 
 def odoo(model, method, args, kwargs=None):
+    models = xmlrpc.client.ServerProxy(f"{ODOO_URL}/xmlrpc/2/object")
     return models.execute_kw(ODOO_DB, odoo_uid(), ODOO_PASS, model, method, args, kwargs or {})
 
 def consultar_inventario(termino):
     prods = odoo("product.product", "search_read",
                  [[["name", "ilike", termino]]],
-                 {"fields": ["name", "qty_available"], "limit": 10})
+                 {"fields": ["id", "name", "default_code"], "limit": 10})
     if not prods:
-        return f"No encontre productos con: {termino}"
+        return f"No encontré productos con '{termino}'."
     lineas = []
     for p in prods:
         grupos = odoo("stock.quant", "read_group",
-                      [[["product_id", "=", p["id"]], ["qty", ">", 0]],
-                       ["qty", "location_id"], ["location_id"]])
-        detalle = ", ".join(f"{g['location_id'][1]}: {g['qty']:g}" for g in grupos) or "sin existencias"
-        lineas.append(f"{p['name']} | total {p['qty_available']:g} | {detalle}")
+                      [[["product_id", "=", p["id"]]]],
+                      {"fields": ["qty", "location_id"], "groupby": ["location_id"]})
+        total = sum(g["qty"] for g in grupos)
+        detalle = ", ".join(f"{g['location_id'][1]}: {g['qty']:.0f}" for g in grupos if g["qty"] != 0)
+        lineas.append(f"{p['name']} — Total: {total:.0f}" + (f" ({detalle})" if detalle else ""))
     return "\n".join(lineas)
 
-SYSTEM = """Eres el agente personal de Israel Becerril. Respondes en espanol, claro y directo.
+def corte_del_dia(sucursal=""):
+    hoy = datetime.now().strftime("%Y-%m-%d")
+    domain = [["date_order", ">=", hoy + " 00:00:00"],
+              ["state", "in", ["paid", "done", "invoiced"]]]
+    if sucursal:
+        domain.append(["session_id.config_id.name", "ilike", sucursal])
+    orders = odoo("pos.order", "search_read", [domain],
+                  {"fields": ["name", "amount_total", "session_id"], "limit": 200})
+    if not orders:
+        return "No hay ventas registradas hoy" + (f" en {sucursal}." if sucursal else ".")
+    total = sum(o["amount_total"] for o in orders)
+    return f"Ventas de hoy{(' en ' + sucursal) if sucursal else ''}: {len(orders)} tickets, total ${total:,.2f} MXN."
 
-SUS NEGOCIOS:
-- Salon de belleza Alika (sucursales Juriquilla y Zaragoza; Terranova cerro)
-- Barberia Cattledogs
-- Paginas: alika.com.mx y cattledogs (WordPress)
-- App de citas: citas-salon.vercel.app
-- ERP: Odoo 8 con sucursales Zaragoza, Juriquilla y Terranova
+def registrar_movimiento(cantidad, producto, sucursal=""):
+    prods = odoo("product.product", "search_read",
+                 [[["name", "ilike", producto]]],
+                 {"fields": ["id", "name", "uom_id"], "limit": 5})
+    if not prods:
+        return f"No encontré el producto '{producto}'."
+    if len(prods) > 1:
+        nombres = ", ".join(p["name"] for p in prods)
+        return f"Encontré varios productos: {nombres}. Sé más específico."
+    p = prods[0]
+    dom_src = [["usage", "=", "internal"]]
+    if sucursal:
+        dom_src.append(["name", "ilike", sucursal])
+    else:
+        dom_src.append(["complete_name", "ilike", "WH/Stock"])
+    src = odoo("stock.location", "search_read", [dom_src],
+               {"fields": ["id", "complete_name"], "limit": 1})
+    dst = odoo("stock.location", "search_read",
+               [[["usage", "=", "inventory"]]],
+               {"fields": ["id", "complete_name"], "limit": 1})
+    if not src or not dst:
+        return "No encontré las ubicaciones de origen/destino en Odoo."
+    move_id = odoo("stock.move", "create", [{
+        "name": f"Uso en cabina: {p['name']}",
+        "product_id": p["id"],
+        "product_uom_qty": float(cantidad),
+        "product_uom": p["uom_id"][0],
+        "location_id": src[0]["id"],
+        "location_dest_id": dst[0]["id"],
+    }])
+    odoo("stock.move", "action_done", [[move_id]])
+    return f"Listo: desconté {cantidad} de '{p['name']}' desde {src[0]['complete_name']}."
 
-PENDIENTES ACTUALES:
-SISTEMA DEL SALON (en orden): 1) revisar categorias 2) catalogo de productos 3) precios y costos 4) catalogo de servicios 5) clientes 6) reglas de comisiones 7) cliente frecuente 8) ficha en el sistema 9) videos de productos y servicios 10) capacitacion de recepcion.
-ODOO: terminar inventario de tintes Zaragoza (por familias; fracciones como 1.5 y 1.25 van como texto); verificar que Terranova quedo en 0 y su producto paso a Zaragoza.
-PERSONALES: firma de contrato de alquiler; revisar con perito los faltantes; revisar carta del perito (la redacta Claude); internet de la casa (prueba fast.com y comprar sistema mesh).
-TIKTOK: descargar CapCut gratis y hacer primer video de prueba.
-APP ESTADOS DE CUENTA: arreglar parser de Nu y clasificacion de gastos por rubro.
-APP INVENTARIO QUIMICOS: construir app Android con Google Sheets.
+def buscar_cliente(nombre):
+    partners = odoo("res.partner", "search_read",
+                    [[["name", "ilike", nombre], ["customer", "=", True]]],
+                    {"fields": ["name", "phone", "mobile", "email"], "limit": 5})
+    if not partners:
+        return f"No encontré clientes con '{nombre}'."
+    return "\n".join(
+        f"{c['name']} — Tel: {c.get('phone') or c.get('mobile') or 'sin teléfono'}"
+        for c in partners)
 
-REGLA ESPECIAL DE INVENTARIO:
-Si el usuario pregunta por inventario, existencias, stock, o cuantos productos/tintes hay de algo, NO inventes la respuesta. Responde UNICAMENTE con:
-BUSCAR: <nombre del producto o familia a buscar>
-Ejemplo: si pregunta "cuantos tintes redken 07T tengo", respondes: BUSCAR: Redken 07T
-Para cualquier otro tema responde normal."""
+SYSTEM = """Eres el agente personal de Israel Becerril (Salón Alika, sucursales Zaragoza y Juriquilla; barbería CattleDogs; ERP Odoo).
 
-historial = {}
+REGLA #1 — COMANDOS ODOO (TIENE PRIORIDAD SOBRE TODO):
+Cuando el usuario pida datos de Odoo, NO respondas con texto normal. Responde ÚNICAMENTE con una línea de comando:
 
-async def iniciar(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Hola Israel! Soy tu agente personal. En que te ayudo?")
+- Inventario/existencias de productos → BUSCAR: <termino>
+- Ventas del día, corte, cobros, cuánto vendí → CORTE: <sucursal o vacío>
+- Registrar uso/salida de producto → MOVI: <cantidad> | <producto> | <sucursal o vacío>
+- Datos de un cliente → CLIENTE: <nombre>
 
-async def responder(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.message.chat_id
-    texto = update.message.text
+Ejemplos de cómo responder (copia este formato exacto):
+Usuario: "cuánto vendí hoy" → CORTE:
+Usuario: "cuánto vendí hoy en Zaragoza" → CORTE: Zaragoza
+Usuario: "ventas de Juriquilla" → CORTE: Juriquilla
+Usuario: "cuántos tintes Hidracolor hay" → BUSCAR: Hidracolor
+Usuario: "hay shampoo Redken?" → BUSCAR: shampoo Redken
+Usuario: "usé 1 tinte 4.52" → MOVI: 1 | Hidracolor 4.52 |
+Usuario: "búscame al cliente María" → CLIENTE: María
+
+NUNCA inventes datos de Odoo. NUNCA digas "no tengo acceso en tiempo real": SÍ tienes acceso vía comandos. Si la pregunta menciona ventas, corte, inventario, productos o clientes, SIEMPRE emite el comando correspondiente.
+
+REGLA #2 — AGENDA:
+Eres el índice de los pendientes de Israel (viene de varios chats de Kimi). Cuando pregunte "qué tengo pendiente", clasifica y lista por proyecto.
+
+Sistema del salón (tareas de la nota, en orden):
+1. Categorías
+2. Catálogo de productos
+3. Precios y costos
+4. Catálogo de servicios
+5. Clientes
+6. Reglas de comisiones
+7. Cliente frecuente
+8. Ficha en el sistema
+9. Videos
+10. Capacitación de recepción
+
+Odoo: terminar inventario de tintes sucursal Zaragoza; poner en cero tintes Terranova.
+
+Pendientes personales:
+- Firma de contrato de alquiler ($9,000 + $750 mantenimiento)
+- Revisar con el perito los faltantes
+- Revisar carta del perito (Claude está redactándola)
+- Internet casa: prueba en fast.com y comprar sistema mesh
+- TikTok: primer video editado en CapCut
+- App: estados de cuenta (parser Nu)
+- App: inventario de químicos
+
+Proyecto bot: Telegram @MiAgenteKimi2026_bot conectado a esta agenda y a Odoo. Después: segundo agente dentro de la app de citas y pasarela de pagos.
+
+Responde en español, directo y conciso, como asistente personal. Cuando te pregunten algo fuera de Odoo, responde normal."""
+
+def ejecutar_comando(texto):
+    t = texto.strip()
+    for linea in t.splitlines():
+        linea = linea.strip()
+        if linea.upper().startswith("BUSCAR:"):
+            return consultar_inventario(linea.split(":", 1)[1].strip())
+        if linea.upper().startswith("CORTE:"):
+            return corte_del_dia(linea.split(":", 1)[1].strip())
+        if linea.upper().startswith("MOVI:"):
+            partes = [x.strip() for x in linea.split(":", 1)[1].split("|")]
+            if len(partes) < 2:
+                return "Formato de movimiento incompleto."
+            return registrar_movimiento(partes[0], partes[1], partes[2] if len(partes) > 2 else "")
+        if linea.upper().startswith("CLIENTE:"):
+            return buscar_cliente(linea.split(":", 1)[1].strip())
+    return None
+
+def responder(chat_id, texto_usuario):
     msgs = historial.setdefault(chat_id, [{"role": "system", "content": SYSTEM}])
-    msgs.append({"role": "user", "content": texto})
+    msgs.append({"role": "user", "content": texto_usuario})
+    r = client.chat.completions.create(model="kimi-k2.6", messages=msgs[-21:])
+    contenido = r.choices[0].message.content
+    print("LLM respondió:", contenido)  # visible en logs de Railway
+    resultado = ejecutar_comando(contenido)
+    if resultado is not None:
+        msgs.append({"role": "assistant", "content": contenido})
+        msgs.append({"role": "user", "content": f"[Resultado de Odoo]\n{resultado}\n\nAhora respóndeme con estos datos, breve y claro."})
+        r2 = client.chat.completions.create(model="kimi-k2.6", messages=msgs[-21:])
+        contenido = r2.choices[0].message.content
+    msgs.append({"role": "assistant", "content": contenido})
+    return contenido
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("Listo, Israel. Soy tu agente: agenda + Odoo. ¿Qué revisamos?")
+
+async def mensaje(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
     try:
-        r = client.chat.completions.create(model="kimi-k2.6", messages=msgs[-20:])
-        respuesta = r.choices[0].message.content
-        if respuesta.strip().upper().startswith("BUSCAR:"):
-            termino = respuesta.split(":", 1)[1].strip()
-            await update.message.reply_text(f"Consultando Odoo: {termino}...")
-            try:
-                datos = consultar_inventario(termino)
-            except Exception as e:
-                datos = f"No pude conectarme a Odoo: {e}"
-            msgs.append({"role": "user", "content": f"Resultados reales del inventario:\n{datos}\n\nRespondeme con estos datos, claro y breve."})
-            r2 = client.chat.completions.create(model="kimi-k2.6", messages=msgs[-20:])
-            respuesta = r2.choices[0].message.content
+        respuesta = responder(chat_id, update.message.text)
     except Exception as e:
-        respuesta = f"Error: {e}"
-    msgs.append({"role": "assistant", "content": respuesta})
+        respuesta = f"Error al consultar: {e}"
     await update.message.reply_text(respuesta)
 
-print("Bot iniciado, esperando mensajes...")
 app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
-app.add_handler(CommandHandler("start", iniciar))
-app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, responder))
+app.add_handler(CommandHandler("start", start))
+app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, mensaje))
 app.run_polling()
