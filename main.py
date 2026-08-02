@@ -257,7 +257,7 @@ def ejecutar_comando(texto):
 def responder(chat_id, texto_usuario):
     msgs = historial.setdefault(chat_id, [{"role": "system", "content": SYSTEM}])
     msgs.append({"role": "user", "content": texto_usuario})
-    r = client.chat.completions.create(model="kimi-k2.6", messages=msgs[-11:])
+    r = client.chat.completions.create(model="kimi-k2.6", messages=[msgs[0]] + msgs[-10:])
     contenido = r.choices[0].message.content
     print("LLM respondió:", contenido)
     resultado = ejecutar_comando(contenido)
