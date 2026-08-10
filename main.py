@@ -66,6 +66,32 @@ def odoo_auth() -> tuple:
     return uid, models
 
 
+def mapa_sucursales(models, uid, orders: List[Dict[str, Any]]) -> Dict[int, str]:
+    """
+    Odoo 8: pos.order NO tiene config_id; la sucursal se obtiene por
+    session_id → pos.session.config_id. Devuelve {order_id: nombre_sucursal}.
+    """
+    ses_ids = list({o["session_id"][0] for o in orders if isinstance(o.get("session_id"), list)})
+    mapa_ses: Dict[int, str] = {}
+    if ses_ids:
+        sessions = models.execute_kw(
+            ODOO_DB, uid, ODOO_PASS,
+            "pos.session", "read",
+            [ses_ids],
+            {"fields": ["config_id"]}
+        )
+        for s in sessions:
+            cfg = s.get("config_id")
+            nombre = cfg[1] if isinstance(cfg, list) else "?"
+            mapa_ses[s["id"]] = nombre.replace(" (no usado)", "")
+    resultado = {}
+    for o in orders:
+        ses = o.get("session_id")
+        ses_id = ses[0] if isinstance(ses, list) else 0
+        resultado[o["id"]] = mapa_ses.get(ses_id, "?")
+    return resultado
+
+
 def rango_utc(fecha_str: str) -> tuple:
     """
     Convierte fecha local MX (UTC-6) a rango UTC.
@@ -101,18 +127,17 @@ def consultar_ventas(fecha_str: str) -> str:
             ODOO_DB, uid, ODOO_PASS,
             "pos.order", "search_read",
             [domain],
-            {"fields": ["name", "amount_total", "config_id", "date_order"]}
+            {"fields": ["name", "amount_total", "session_id", "date_order"]}
         )
 
         if not orders:
             return f"📭 No hay ventas registradas para {fecha_str}."
 
+        sucursales = mapa_sucursales(models, uid, orders)
         total = sum(o["amount_total"] for o in orders)
         por_sucursal: Dict[str, float] = {}
         for o in orders:
-            suc = o.get("config_id")
-            suc_name = suc[1] if isinstance(suc, list) else str(suc)
-            suc_name = suc_name.replace(" (no usado)", "")
+            suc_name = sucursales.get(o["id"], "?")
             por_sucursal[suc_name] = por_sucursal.get(suc_name, 0) + o["amount_total"]
 
         lineas = [f"💰 *Ventas {fecha_str}*", f"Total: ${total:,.2f}", ""]
@@ -264,40 +289,49 @@ def cierre_caja(fecha_str: str) -> str:
         uid, models = odoo_auth()
         inicio, fin = rango_utc(fecha_str)
 
+        # Odoo 8: no existe pos.payment. Los cobros van en
+        # account.bank.statement.line ligados por pos.order.statement_ids
         domain = [
-            ("pos_order_id.date_order", ">=", inicio),
-            ("pos_order_id.date_order", "<", fin),
+            ("date_order", ">=", inicio),
+            ("date_order", "<", fin),
+            ("state", "in", ["paid", "done", "invoiced"]),
         ]
-        pagos = models.execute_kw(
-            ODOO_DB, uid, ODOO_PASS,
-            "pos.payment", "search_read",
-            [domain],
-            {"fields": ["amount", "payment_method_id", "pos_order_id"]}
-        )
-        if not pagos:
-            return f"📭 No hay pagos registrados para {fecha_str}."
-
-        order_ids = list({p["pos_order_id"][0] for p in pagos if isinstance(p.get("pos_order_id"), list)})
         orders = models.execute_kw(
             ODOO_DB, uid, ODOO_PASS,
-            "pos.order", "read",
-            [order_ids],
-            {"fields": ["config_id"]}
+            "pos.order", "search_read",
+            [domain],
+            {"fields": ["statement_ids", "session_id"]}
         )
-        mapa_suc = {}
+        if not orders:
+            return f"📭 No hay ventas registradas para {fecha_str}."
+
+        sucursales = mapa_sucursales(models, uid, orders)
+        line_ids = []
+        mapa_linea_suc = {}
         for o in orders:
-            suc = o.get("config_id")
-            nombre = suc[1] if isinstance(suc, list) else "?"
-            mapa_suc[o["id"]] = nombre.replace(" (no usado)", "")
+            suc_name = sucursales.get(o["id"], "?")
+            for lid in o.get("statement_ids", []):
+                line_ids.append(lid)
+                mapa_linea_suc[lid] = suc_name
+
+        if not line_ids:
+            return f"📭 No hay pagos registrados para {fecha_str}."
+
+        lineas_pago = models.execute_kw(
+            ODOO_DB, uid, ODOO_PASS,
+            "account.bank.statement.line", "read",
+            [line_ids],
+            {"fields": ["amount", "journal_id"]}
+        )
 
         por_metodo: Dict[str, float] = {}
         por_suc: Dict[str, Dict[str, float]] = {}
         total = 0.0
-        for p in pagos:
-            met = p.get("payment_method_id")
+        for p in lineas_pago:
+            met = p.get("journal_id")
             met_name = met[1] if isinstance(met, list) else "Otro"
             monto = p.get("amount", 0.0)
-            suc = mapa_suc.get(p["pos_order_id"][0] if isinstance(p.get("pos_order_id"), list) else 0, "?")
+            suc = mapa_linea_suc.get(p["id"], "?")
             por_metodo[met_name] = por_metodo.get(met_name, 0) + monto
             por_suc.setdefault(suc, {})
             por_suc[suc][met_name] = por_suc[suc].get(met_name, 0) + monto
