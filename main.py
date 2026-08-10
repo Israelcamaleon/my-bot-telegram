@@ -36,7 +36,10 @@ ODOO_PASS = "Alika5835"
 
 OWNER_CHAT_ID = 1000342482
 
-PENDIENTES_FILE = "pendientes.json"
+# Si Railway tiene un Volume montado en /data, úsalo (sobrevive a despliegues).
+# Si no, usa el archivo local (se borra en cada deploy).
+DATA_DIR = "/data" if os.path.isdir("/data") else "."
+PENDIENTES_FILE = os.path.join(DATA_DIR, "pendientes.json")
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
