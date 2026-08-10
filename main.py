@@ -498,10 +498,9 @@ async def mensaje_libre(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(resp, parse_mode="Markdown")
         return
 
-    # ─── Detectar PENDIENTES ───────────────────────────────────────────────
-    if any(k in upper for k in ["PENDIENTES", "AGENDA", "MIS PENDIENTES", "PENDIENTE"]):
-        await cmd_pendientes(update, context)
-        return
+    # ─── 1. ACCIONES de pendientes primero ─────────────────────────────────
+    # (van antes que la consulta PENDIENTES para que "Agrega pendiente ..."
+    #  no caiga en la lista de pendientes por error)
 
     # ─── Detectar AGREGA ───────────────────────────────────────────────────
     if any(upper.startswith(k) for k in ["AGREGA ", "AGREGAR ", "NUEVO PENDIENTE ", "AÑADIR "]):
@@ -529,6 +528,11 @@ async def mensaje_libre(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 break
         context.args = resto.split() if resto else []
         await cmd_ya_termine(update, context)
+        return
+
+    # ─── 2. CONSULTA de pendientes después ─────────────────────────────────
+    if any(k in upper for k in ["PENDIENTES", "AGENDA", "MIS PENDIENTES"]):
+        await cmd_pendientes(update, context)
         return
 
     # ─── Si no coincide con nada, pasar al LLM ─────────────────────────────
