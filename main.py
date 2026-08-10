@@ -48,17 +48,32 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # ─── Persistencia de pendientes ──────────────────────────────────────────────
-def cargar_pendientes() -> List[Dict[str, Any]]:
+def cargar_pendientes() -> Dict[str, List[Dict[str, Any]]]:
+    """
+    Carga las listas de pendientes: {"general": [...], "compras": [...], ...}
+    Migra automáticamente el formato viejo (una sola lista) a "general".
+    """
     try:
         with open(PENDIENTES_FILE, "r", encoding="utf-8") as f:
-            return json.load(f)
+            data = json.load(f)
     except (FileNotFoundError, json.JSONDecodeError):
-        return []
+        return {"general": []}
+
+    if isinstance(data, list):  # formato viejo → migrar
+        data = {"general": data}
+    if "general" not in data:
+        data["general"] = []
+    return data
 
 
-def guardar_pendientes(pendientes: List[Dict[str, Any]]):
+def guardar_pendientes(data: Dict[str, List[Dict[str, Any]]]):
     with open(PENDIENTES_FILE, "w", encoding="utf-8") as f:
-        json.dump(pendientes, f, ensure_ascii=False, indent=2)
+        json.dump(data, f, ensure_ascii=False, indent=2)
+
+
+def normalizar_lista(nombre: str) -> str:
+    """Nombre de lista en minúsculas, sin espacios extra."""
+    return " ".join(nombre.strip().lower().split())
 
 
 # ─── Odoo helpers ────────────────────────────────────────────────────────────
@@ -397,8 +412,8 @@ async def llamar_kimi(user_msg: str, context_history: List[Dict] = None) -> str:
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "🤖 *MiAgenteKimi2026* listo.\n"
-        "Comandos: CORTE | DETALLE | CIERRE | COMPARATIVO | BUSCAR | CLIENTE | MOVI | PENDIENTES\n"
-        "Ejemplos: `Cierre hoy` · `Cómo voy vs el año pasado` · `Mueve 5 shampoo a Juriquilla`",
+        "Comandos: CORTE | DETALLE | CIERRE | COMPARATIVO | BUSCAR | CLIENTE | MOVI | PENDIENTES | LISTAS\n"
+        "Ejemplos: `Cierre hoy` · `Cómo voy vs el año pasado` · `Mueve 5 shampoo a Juriquilla` · `Agrega a compras: papel`",
         parse_mode="Markdown",
     )
 
@@ -586,101 +601,235 @@ async def cmd_cierre(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(cierre_caja(fecha), parse_mode="Markdown")
 
 
-# ─── SISTEMA DE PENDIENTES ───────────────────────────────────────────────────
+# ─── SISTEMA DE PENDIENTES (con listas) ──────────────────────────────────────
+def _resolver_lista_y_numero(args, data):
+    """
+    De args como ["compras","2"] o ["2"] devuelve (nombre_lista, numero, resto).
+    Si el primer arg no es número, se toma como nombre de lista.
+    """
+    if not args:
+        return None, None, []
+    try:
+        int(args[0])
+        return "general", int(args[0]), args[1:]
+    except ValueError:
+        nombre = normalizar_lista(args[0])
+        num = None
+        resto = args[1:]
+        if resto:
+            try:
+                num = int(resto[0])
+                resto = resto[1:]
+            except ValueError:
+                pass
+        return nombre, num, resto
+
+
+async def cmd_listas(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Muestra todas las listas con su conteo de pendientes."""
+    data = cargar_pendientes()
+    lineas = ["🗂️ *Tus listas de pendientes:*", ""]
+    for nombre, items in data.items():
+        activos = sum(1 for p in items if not p.get("hecho"))
+        if items or nombre == "general":
+            lineas.append(f"• *{nombre}*: {activos} pendiente(s)")
+    lineas.append("\nPara crear una: `NUEVA LISTA <nombre>`")
+    lineas.append("Para ver una: `PENDIENTES <nombre>`")
+    await update.message.reply_text("\n".join(lineas), parse_mode="Markdown")
+
+
+async def cmd_nueva_lista(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Crea una lista nueva."""
+    nombre = normalizar_lista(" ".join(context.args))
+    if not nombre:
+        await update.message.reply_text("Uso: `NUEVA LISTA <nombre>`", parse_mode="Markdown")
+        return
+    data = cargar_pendientes()
+    if nombre in data:
+        await update.message.reply_text(f"ℹ️ La lista *{nombre}* ya existe.", parse_mode="Markdown")
+        return
+    data[nombre] = []
+    guardar_pendientes(data)
+    await update.message.reply_text(
+        f"✅ Lista *{nombre}* creada.\n"
+        f"Agrega algo así: `AGREGA A {nombre}: tu pendiente`",
+        parse_mode="Markdown",
+    )
+
+
+async def cmd_borrar_lista(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Borra una lista completa con sus pendientes."""
+    nombre = normalizar_lista(" ".join(context.args))
+    if not nombre:
+        await update.message.reply_text("Uso: `BORRAR LISTA <nombre>`", parse_mode="Markdown")
+        return
+    if nombre == "general":
+        await update.message.reply_text("⚠️ La lista *general* no se puede borrar.", parse_mode="Markdown")
+        return
+    data = cargar_pendientes()
+    if nombre not in data:
+        await update.message.reply_text(f"❌ No existe la lista *{nombre}*.", parse_mode="Markdown")
+        return
+    cuantos = len(data.pop(nombre))
+    guardar_pendientes(data)
+    await update.message.reply_text(
+        f"🗑️ Lista *{nombre}* borrada con {cuantos} pendiente(s).",
+        parse_mode="Markdown",
+    )
+
+
 async def cmd_pendientes(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Lista los pendientes numerados."""
-    lista = cargar_pendientes()
-    if not lista:
-        await update.message.reply_text("📭 No tienes pendientes activos.")
+    """Lista pendientes: todos, o solo de una lista si se pasa su nombre."""
+    data = cargar_pendientes()
+    nombre = normalizar_lista(" ".join(context.args)) if context.args else ""
+
+    if nombre:
+        if nombre not in data:
+            await update.message.reply_text(f"❌ No existe la lista *{nombre}*.", parse_mode="Markdown")
+            return
+        items = data[nombre]
+        if not items:
+            await update.message.reply_text(f"📭 La lista *{nombre}* está vacía.", parse_mode="Markdown")
+            return
+        lineas = [f"📝 *Pendientes de {nombre}:*", ""]
+        for i, p in enumerate(items, 1):
+            estado = "✅" if p.get("hecho") else "⬜"
+            fecha = p.get("creado", "")[:10]
+            lineas.append(f"{estado} *{i}.* {p['texto']} _(creado {fecha})_")
+        lineas.append(f"\nPara quitar uno: `QUITAR {nombre} <número>`")
+        await update.message.reply_text("\n".join(lineas), parse_mode="Markdown")
         return
 
-    lineas = ["📝 *Tus pendientes:*", ""]
-    for i, p in enumerate(lista, 1):
-        estado = "✅" if p.get("hecho") else "⬜"
-        fecha = p.get("creado", "")[:10]
-        lineas.append(f"{estado} *{i}.* {p['texto']} _(creado {fecha})_")
-    lineas.append("\nPara quitar uno: `QUITAR <número>` o `YA TERMINÉ <número>`")
+    # Todas las listas
+    hay_algo = any(items for items in data.values())
+    if not hay_algo:
+        await update.message.reply_text("📭 No tienes pendientes activos.")
+        return
+    lineas = ["📝 *Tus pendientes:*"]
+    for nombre_l, items in data.items():
+        if not items:
+            continue
+        lineas.append(f"\n🗂️ *{nombre_l.upper()}*")
+        for i, p in enumerate(items, 1):
+            estado = "✅" if p.get("hecho") else "⬜"
+            lineas.append(f"{estado} *{i}.* {p['texto']}")
+    lineas.append("\nPara quitar: `QUITAR <lista> <número>` o `YA TERMINÉ <lista> <número>`")
     await update.message.reply_text("\n".join(lineas), parse_mode="Markdown")
 
 
 async def cmd_agrega_pendiente(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Agrega un nuevo pendiente."""
+    """
+    Agrega un pendiente.
+    AGREGA <texto>              → lista general
+    AGREGA A <lista>: <texto>   → esa lista (la crea si no existe)
+    """
     texto = " ".join(context.args)
     if not texto:
-        await update.message.reply_text("Uso: AGREGA <texto del pendiente>")
+        await update.message.reply_text(
+            "Uso: `AGREGA <texto>` o `AGREGA A <lista>: <texto>`",
+            parse_mode="Markdown",
+        )
         return
 
-    lista = cargar_pendientes()
-    lista.append({
+    nombre = "general"
+    m = re.match(r"(?i)^a\s+([^:]+?):\s*(.+)$", texto)
+    if m:
+        nombre = normalizar_lista(m.group(1))
+        texto = m.group(2).strip()
+
+    data = cargar_pendientes()
+    lista_nueva = nombre not in data
+    data.setdefault(nombre, [])
+    data[nombre].append({
         "texto": texto,
         "creado": datetime.now().isoformat(),
         "hecho": False,
     })
-    guardar_pendientes(lista)
-    await update.message.reply_text(f"✅ Pendiente agregado: *{texto}*", parse_mode="Markdown")
+    guardar_pendientes(data)
+
+    aviso = f" (lista *{nombre}* recién creada)" if lista_nueva and nombre != "general" else ""
+    await update.message.reply_text(
+        f"✅ Agregado a *{nombre}*{aviso}: _{texto}_",
+        parse_mode="Markdown",
+    )
 
 
 async def cmd_quitar_pendiente(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Quita un pendiente por número."""
+    """QUITAR <número> o QUITAR <lista> <número>."""
     args = context.args
     if not args:
-        await update.message.reply_text("Uso: QUITAR <número del pendiente>")
+        await update.message.reply_text("Uso: `QUITAR <número>` o `QUITAR <lista> <número>`", parse_mode="Markdown")
         return
 
-    try:
-        num = int(args[0])
-    except ValueError:
-        await update.message.reply_text("❌ Escribe un número. Ejemplo: QUITAR 2")
+    data = cargar_pendientes()
+    nombre, num, _ = _resolver_lista_y_numero(args, data)
+    if nombre not in data:
+        await update.message.reply_text(f"❌ No existe la lista *{nombre}*.", parse_mode="Markdown")
+        return
+    if num is None:
+        await update.message.reply_text("❌ Escribe un número. Ejemplo: `QUITAR compras 2`", parse_mode="Markdown")
         return
 
-    lista = cargar_pendientes()
+    lista = data[nombre]
     if num < 1 or num > len(lista):
-        await update.message.reply_text(f"❌ No existe el pendiente {num}. Tienes {len(lista)} pendientes.")
+        await update.message.reply_text(f"❌ No existe el pendiente {num} en *{nombre}*.", parse_mode="Markdown")
         return
 
     eliminado = lista.pop(num - 1)
-    guardar_pendientes(lista)
+    guardar_pendientes(data)
     await update.message.reply_text(
-        f"🗑️ Pendiente *{num}* eliminado: _{eliminado['texto']}_\n"
-        f"Te quedan {len(lista)} pendientes.",
+        f"🗑️ Eliminado de *{nombre}*: _{eliminado['texto']}_\n"
+        f"Quedan {len(lista)} en esa lista.",
         parse_mode="Markdown",
     )
 
 
 async def cmd_ya_termine(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Marca un pendiente como terminado (o lo quita)."""
+    """
+    YA TERMINÉ <número> | YA TERMINÉ <lista> <número> | YA TERMINÉ <lista> <texto a buscar>
+    """
     args = context.args
     if not args:
-        await update.message.reply_text("Uso: YA TERMINÉ <número del pendiente>")
+        await update.message.reply_text("Uso: `YA TERMINÉ <número>` o `YA TERMINÉ <lista> <número>`", parse_mode="Markdown")
         return
 
-    try:
-        num = int(args[0])
-    except ValueError:
+    data = cargar_pendientes()
+    nombre, num, resto = _resolver_lista_y_numero(args, data)
+
+    if nombre not in data:
+        # Quizás escribió texto a buscar en general, ej. "YA TERMINÉ agua"
         texto_buscar = " ".join(args).lower()
-        lista = cargar_pendientes()
-        for i, p in enumerate(lista):
+        for i, p in enumerate(data["general"]):
             if texto_buscar in p["texto"].lower():
-                eliminado = lista.pop(i)
-                guardar_pendientes(lista)
-                await update.message.reply_text(
-                    f"✅ Pendiente eliminado: _{eliminado['texto']}_",
-                    parse_mode="Markdown",
-                )
+                eliminado = data["general"].pop(i)
+                guardar_pendientes(data)
+                await update.message.reply_text(f"✅ Completado: _{eliminado['texto']}_", parse_mode="Markdown")
                 return
-        await update.message.reply_text("❌ No encontré ese pendiente.")
+        await update.message.reply_text(f"❌ No existe la lista *{nombre}* ni un pendiente con ese texto.")
         return
 
-    lista = cargar_pendientes()
-    if num < 1 or num > len(lista):
-        await update.message.reply_text(f"❌ No existe el pendiente {num}.")
-        return
+    lista = data[nombre]
+    if num is not None:
+        if num < 1 or num > len(lista):
+            await update.message.reply_text(f"❌ No existe el pendiente {num} en *{nombre}*.", parse_mode="Markdown")
+            return
+        eliminado = lista.pop(num - 1)
+    else:
+        texto_buscar = " ".join(resto).lower() if resto else ""
+        eliminado = None
+        if texto_buscar:
+            for i, p in enumerate(lista):
+                if texto_buscar in p["texto"].lower():
+                    eliminado = lista.pop(i)
+                    break
+        if eliminado is None:
+            await update.message.reply_text("❌ No encontré ese pendiente.")
+            return
 
-    eliminado = lista.pop(num - 1)
-    guardar_pendientes(lista)
+    guardar_pendientes(data)
     await update.message.reply_text(
-        f"✅ ¡Bien hecho! Pendiente *{num}* completado: _{eliminado['texto']}_\n"
-        f"Te quedan {len(lista)} pendientes.",
+        f"✅ ¡Bien hecho! Completado en *{nombre}*: _{eliminado['texto']}_\n"
+        f"Quedan {len(lista)} en esa lista.",
         parse_mode="Markdown",
     )
 
@@ -801,8 +950,30 @@ async def mensaje_libre(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await cmd_ya_termine(update, context)
         return
 
+    # ─── Listas de pendientes: crear, borrar, ver ──────────────────────────
+    if upper.startswith("NUEVA LISTA ") or upper.startswith("NUEVA LISTA"):
+        context.args = palabras[2:]
+        await cmd_nueva_lista(update, context)
+        return
+
+    if upper.startswith("BORRAR LISTA "):
+        context.args = palabras[2:]
+        await cmd_borrar_lista(update, context)
+        return
+
+    if upper in ("LISTAS", "MIS LISTAS"):
+        await cmd_listas(update, context)
+        return
+
     # ─── 2. CONSULTA de pendientes después ─────────────────────────────────
     if any(k in upper for k in ["PENDIENTES", "AGENDA", "MIS PENDIENTES"]):
+        # "PENDIENTES compras" → solo esa lista; "PENDIENTES" → todas
+        if upper.startswith("PENDIENTES "):
+            context.args = palabras[1:]
+        elif upper.startswith("AGENDA "):
+            context.args = palabras[1:]
+        else:
+            context.args = []
         await cmd_pendientes(update, context)
         return
 
@@ -847,6 +1018,9 @@ def main():
     application.add_handler(CommandHandler("ya_termine", cmd_ya_termine))
     application.add_handler(CommandHandler("comparativo", cmd_comparativo))
     application.add_handler(CommandHandler("cierre", cmd_cierre))
+    application.add_handler(CommandHandler("listas", cmd_listas))
+    application.add_handler(CommandHandler("nueva_lista", cmd_nueva_lista))
+    application.add_handler(CommandHandler("borrar_lista", cmd_borrar_lista))
 
     # Conversación MOVI
     movi_conv = ConversationHandler(
