@@ -72,8 +72,20 @@ def guardar_pendientes(data: Dict[str, List[Dict[str, Any]]]):
 
 
 def normalizar_lista(nombre: str) -> str:
-    """Nombre de lista en minúsculas, sin espacios extra."""
-    return " ".join(nombre.strip().lower().split())
+    """
+    Nombre de lista en minúsculas. Admite sub-listas con "/":
+    "Casa / Despensa" → "casa/despensa"
+    """
+    partes = [" ".join(p.strip().split()) for p in nombre.strip().lower().split("/")]
+    return "/".join(p for p in partes if p)
+
+
+def listas_coincidentes(data: Dict[str, List[Dict[str, Any]]], nombre: str) -> List[str]:
+    """
+    Listas que coinciden con `nombre`: la lista exacta o sus sub-listas.
+    "casa" → ["casa", "casa/despensa", "casa/mantenimiento"]
+    """
+    return sorted(k for k in data if k == nombre or k.startswith(nombre + "/"))
 
 
 # ─── Odoo helpers ────────────────────────────────────────────────────────────
@@ -667,15 +679,24 @@ async def cmd_borrar_lista(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("⚠️ La lista *general* no se puede borrar.", parse_mode="Markdown")
         return
     data = cargar_pendientes()
-    if nombre not in data:
+    coincide = listas_coincidentes(data, nombre)
+    if not coincide:
         await update.message.reply_text(f"❌ No existe la lista *{nombre}*.", parse_mode="Markdown")
         return
-    cuantos = len(data.pop(nombre))
+    total = 0
+    for nombre_l in coincide:
+        total += len(data.pop(nombre_l, []))
     guardar_pendientes(data)
-    await update.message.reply_text(
-        f"🗑️ Lista *{nombre}* borrada con {cuantos} pendiente(s).",
-        parse_mode="Markdown",
-    )
+    if len(coincide) > 1:
+        await update.message.reply_text(
+            f"🗑️ Borradas {len(coincide)} listas de *{nombre}* ({', '.join(coincide)}) con {total} pendiente(s).",
+            parse_mode="Markdown",
+        )
+    else:
+        await update.message.reply_text(
+            f"🗑️ Lista *{nombre}* borrada con {total} pendiente(s).",
+            parse_mode="Markdown",
+        )
 
 
 async def cmd_pendientes(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -684,19 +705,25 @@ async def cmd_pendientes(update: Update, context: ContextTypes.DEFAULT_TYPE):
     nombre = normalizar_lista(" ".join(context.args)) if context.args else ""
 
     if nombre:
-        if nombre not in data:
+        coincide = listas_coincidentes(data, nombre)
+        if not coincide:
             await update.message.reply_text(f"❌ No existe la lista *{nombre}*.", parse_mode="Markdown")
             return
-        items = data[nombre]
-        if not items:
+        lineas = []
+        for nombre_l in coincide:
+            items = data[nombre_l]
+            if not items:
+                continue
+            lineas.append(f"🗂️ *{nombre_l.upper()}*")
+            for i, p in enumerate(items, 1):
+                estado = "✅" if p.get("hecho") else "⬜"
+                fecha = p.get("creado", "")[:10]
+                lineas.append(f"{estado} *{i}.* {p['texto']} _(creado {fecha})_")
+            lineas.append("")
+        if not lineas:
             await update.message.reply_text(f"📭 La lista *{nombre}* está vacía.", parse_mode="Markdown")
             return
-        lineas = [f"📝 *Pendientes de {nombre}:*", ""]
-        for i, p in enumerate(items, 1):
-            estado = "✅" if p.get("hecho") else "⬜"
-            fecha = p.get("creado", "")[:10]
-            lineas.append(f"{estado} *{i}.* {p['texto']} _(creado {fecha})_")
-        lineas.append(f"\nPara quitar uno: `QUITAR {nombre} <número>`")
+        lineas.append(f"Para quitar uno: `QUITAR {coincide[0]} <número>`")
         await update.message.reply_text("\n".join(lineas), parse_mode="Markdown")
         return
 
@@ -737,19 +764,27 @@ async def cmd_agrega_pendiente(update: Update, context: ContextTypes.DEFAULT_TYP
         nombre = normalizar_lista(m.group(1))
         texto = m.group(2).strip()
 
+    # Varios pendientes separados por comas: "jamón, leche, huevo"
+    partes = [t.strip() for t in texto.split(",") if t.strip()]
+    if not partes:
+        await update.message.reply_text("❌ No entendí el pendiente. Ejemplo: `AGREGA A casa/despensa: jamón, leche`", parse_mode="Markdown")
+        return
+
     data = cargar_pendientes()
     lista_nueva = nombre not in data
     data.setdefault(nombre, [])
-    data[nombre].append({
-        "texto": texto,
-        "creado": datetime.now().isoformat(),
-        "hecho": False,
-    })
+    for t in partes:
+        data[nombre].append({
+            "texto": t,
+            "creado": datetime.now().isoformat(),
+            "hecho": False,
+        })
     guardar_pendientes(data)
 
-    aviso = f" (lista *{nombre}* recién creada)" if lista_nueva and nombre != "general" else ""
+    aviso = f" (lista recién creada)" if lista_nueva and nombre != "general" else ""
+    agregados = ", ".join(f"_{t}_" for t in partes)
     await update.message.reply_text(
-        f"✅ Agregado a *{nombre}*{aviso}: _{texto}_",
+        f"✅ Agregado(s) a *{nombre}*{aviso}: {agregados}",
         parse_mode="Markdown",
     )
 
