@@ -1,6 +1,7 @@
 """
 Bot Telegram @MiAgenteKimi2026_bot — Contador de Alika / CattleDogs
-v3: Fix paréntesis en línea 113.
+v4: MOVI amigable (por nombre), comparativo vs año pasado, cierre de caja
+    por forma de pago, y fix de orden AGREGA vs PENDIENTES.
 """
 import os
 import json
@@ -204,6 +205,119 @@ def consultar_cliente(q: str) -> str:
         return f"❌ Error cliente: {e}"
 
 
+def _ventas_en_rango(models, uid, inicio_utc: str, fin_utc: str) -> tuple:
+    """Devuelve (total, num_tickets) de pos.order en un rango UTC."""
+    domain = [
+        ("date_order", ">=", inicio_utc),
+        ("date_order", "<", fin_utc),
+        ("state", "in", ["paid", "done", "invoiced"]),
+    ]
+    orders = models.execute_kw(
+        ODOO_DB, uid, ODOO_PASS,
+        "pos.order", "search_read",
+        [domain],
+        {"fields": ["amount_total"]}
+    )
+    return sum(o["amount_total"] for o in orders), len(orders)
+
+
+def comparativo_mes() -> str:
+    """Mes actual (al día de hoy) vs el mismo periodo del año pasado. MX = UTC-6."""
+    try:
+        uid, models = odoo_auth()
+        hoy = datetime.now()
+
+        ini_act = datetime(hoy.year, hoy.month, 1) + timedelta(hours=6)
+        fin_act = datetime(hoy.year, hoy.month, hoy.day) + timedelta(days=1, hours=6)
+        ini_ant = datetime(hoy.year - 1, hoy.month, 1) + timedelta(hours=6)
+        fin_ant = datetime(hoy.year - 1, hoy.month, hoy.day) + timedelta(days=1, hours=6)
+
+        fmt = "%Y-%m-%d %H:%M:%S"
+        tot_act, tic_act = _ventas_en_rango(models, uid, ini_act.strftime(fmt), fin_act.strftime(fmt))
+        tot_ant, tic_ant = _ventas_en_rango(models, uid, ini_ant.strftime(fmt), fin_ant.strftime(fmt))
+
+        meses = ["", "enero", "febrero", "marzo", "abril", "mayo", "junio",
+                 "julio", "agosto", "septiembre", "octubre", "noviembre", "diciembre"]
+        nombre_mes = meses[hoy.month]
+
+        lineas = [f"📊 *Comparativo {nombre_mes}* (del 1 al {hoy.day})", ""]
+        lineas.append(f"• {hoy.year}: ${tot_act:,.2f} — {tic_act} tickets")
+        lineas.append(f"• {hoy.year - 1}: ${tot_ant:,.2f} — {tic_ant} tickets")
+
+        if tot_ant > 0:
+            dif = ((tot_act - tot_ant) / tot_ant) * 100
+            flecha = "📈" if dif >= 0 else "📉"
+            lineas.append(f"\n{flecha} Diferencia: {dif:+.1f}% (${tot_act - tot_ant:+,.2f})")
+        if tic_act > 0 and tic_ant > 0:
+            lineas.append(f"🎫 Ticket promedio: ${tot_act / tic_act:,.2f} vs ${tot_ant / tic_ant:,.2f}")
+        if tot_act == 0 and tot_ant == 0:
+            lineas.append("\n📭 No hay ventas registradas en ninguno de los dos periodos.")
+        return "\n".join(lineas)
+    except Exception as e:
+        logger.error(f"Error comparativo: {e}")
+        return f"❌ Error en comparativo: {e}"
+
+
+def cierre_caja(fecha_str: str) -> str:
+    """Cierre de caja del día: totales por forma de pago y sucursal."""
+    try:
+        uid, models = odoo_auth()
+        inicio, fin = rango_utc(fecha_str)
+
+        domain = [
+            ("pos_order_id.date_order", ">=", inicio),
+            ("pos_order_id.date_order", "<", fin),
+        ]
+        pagos = models.execute_kw(
+            ODOO_DB, uid, ODOO_PASS,
+            "pos.payment", "search_read",
+            [domain],
+            {"fields": ["amount", "payment_method_id", "pos_order_id"]}
+        )
+        if not pagos:
+            return f"📭 No hay pagos registrados para {fecha_str}."
+
+        order_ids = list({p["pos_order_id"][0] for p in pagos if isinstance(p.get("pos_order_id"), list)})
+        orders = models.execute_kw(
+            ODOO_DB, uid, ODOO_PASS,
+            "pos.order", "read",
+            [order_ids],
+            {"fields": ["config_id"]}
+        )
+        mapa_suc = {}
+        for o in orders:
+            suc = o.get("config_id")
+            nombre = suc[1] if isinstance(suc, list) else "?"
+            mapa_suc[o["id"]] = nombre.replace(" (no usado)", "")
+
+        por_metodo: Dict[str, float] = {}
+        por_suc: Dict[str, Dict[str, float]] = {}
+        total = 0.0
+        for p in pagos:
+            met = p.get("payment_method_id")
+            met_name = met[1] if isinstance(met, list) else "Otro"
+            monto = p.get("amount", 0.0)
+            suc = mapa_suc.get(p["pos_order_id"][0] if isinstance(p.get("pos_order_id"), list) else 0, "?")
+            por_metodo[met_name] = por_metodo.get(met_name, 0) + monto
+            por_suc.setdefault(suc, {})
+            por_suc[suc][met_name] = por_suc[suc].get(met_name, 0) + monto
+            total += monto
+
+        lineas = [f"🧾 *Cierre de caja {fecha_str}*", f"Total cobrado: ${total:,.2f}", ""]
+        lineas.append("*Por forma de pago:*")
+        for met, monto in sorted(por_metodo.items(), key=lambda x: -x[1]):
+            lineas.append(f"• {met}: ${monto:,.2f}")
+        lineas.append("\n*Por sucursal:*")
+        for suc, metodos in por_suc.items():
+            lineas.append(f"🏪 {suc}: ${sum(metodos.values()):,.2f}")
+            for met, monto in sorted(metodos.items(), key=lambda x: -x[1]):
+                lineas.append(f"   ◦ {met}: ${monto:,.2f}")
+        return "\n".join(lineas)
+    except Exception as e:
+        logger.error(f"Error cierre: {e}")
+        return f"❌ Error en cierre de caja: {e}"
+
+
 # ─── Kimi LLM ────────────────────────────────────────────────────────────────
 async def llamar_kimi(user_msg: str, context_history: List[Dict] = None) -> str:
     system_msg = {
@@ -246,7 +360,8 @@ async def llamar_kimi(user_msg: str, context_history: List[Dict] = None) -> str:
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "🤖 *MiAgenteKimi2026* listo.\n"
-        "Comandos: CORTE | DETALLE | BUSCAR | CLIENTE | MOVI | PENDIENTES",
+        "Comandos: CORTE | DETALLE | CIERRE | COMPARATIVO | BUSCAR | CLIENTE | MOVI | PENDIENTES\n"
+        "Ejemplos: `Cierre hoy` · `Cómo voy vs el año pasado` · `Mueve 5 shampoo a Juriquilla`",
         parse_mode="Markdown",
     )
 
@@ -286,22 +401,101 @@ async def cmd_cliente(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ─── MOVI (movimientos de inventario) — solo con confirmación ────────────────
 MOVI_WAIT_CONFIRM = 1
 
+def _buscar_producto_odoo(models, uid, nombre: str):
+    """Busca un producto por nombre. Devuelve dict o None."""
+    prods = models.execute_kw(
+        ODOO_DB, uid, ODOO_PASS,
+        "product.product", "search_read",
+        [[("name", "ilike", nombre)]],
+        {"fields": ["name", "uom_id", "qty_available"], "limit": 5}
+    )
+    return prods
+
+
+def _buscar_ubicacion_odoo(models, uid, nombre: str):
+    """Busca una ubicación interna por nombre (sucursal)."""
+    locs = models.execute_kw(
+        ODOO_DB, uid, ODOO_PASS,
+        "stock.location", "search_read",
+        [[("name", "ilike", nombre), ("usage", "=", "internal")]],
+        {"fields": ["name"], "limit": 5}
+    )
+    return locs
+
+
 async def cmd_movi(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    args = context.args
-    if len(args) < 3:
+    """
+    MOVI amigable:  MOVI 5 shampoo a Juriquilla
+    También acepta:  mueve 5 shampoo a Juriquilla / pasa 3 ceras a Zaragoza
+    Modo viejo con IDs: MOVI 45 12 5
+    """
+    texto = " ".join(context.args) if context.args else ""
+
+    # ─── Modo viejo: 3 números (producto_id ubicación_id cantidad) ───
+    partes = texto.split()
+    if len(partes) == 3 and all(p.replace(".", "").isdigit() for p in partes):
+        context.user_data["movi"] = {
+            "product_id": int(partes[0]),
+            "location_dest_id": int(partes[1]),
+            "product_uom_qty": float(partes[2]),
+            "product_uom": 1,
+            "desc": f"Producto ID {partes[0]} | Destino ID {partes[1]} | Cantidad: {partes[2]}",
+        }
         await update.message.reply_text(
-            "Uso: MOVI <producto_id> <ubicación_destino_id> <cantidad>\n"
-            "Ejemplo: MOVI 45 12 5"
+            f"⚠️ ¿Registrar movimiento?\n{context.user_data['movi']['desc']}\n"
+            f"Responde: *sí* para confirmar o *no* para cancelar.",
+            parse_mode="Markdown",
         )
-        return
+        return MOVI_WAIT_CONFIRM
+
+    # ─── Modo amigable: <cantidad> <producto> a <sucursal> ───
+    m = re.match(r"^\s*(\d+(?:\.\d+)?)\s+(.+?)\s+(?:a|en|hacia)\s+(.+?)\s*$", texto, re.IGNORECASE)
+    if not m:
+        await update.message.reply_text(
+            "Para mover inventario escribe:\n"
+            "• `MOVI 5 shampoo a Juriquilla`\n"
+            "• o con IDs: `MOVI 45 12 5`",
+            parse_mode="Markdown",
+        )
+        return ConversationHandler.END
+
+    cantidad = float(m.group(1))
+    nombre_prod = m.group(2).strip()
+    nombre_dest = m.group(3).strip()
+
+    try:
+        uid, models = odoo_auth()
+    except Exception as e:
+        await update.message.reply_text(f"❌ Error conectando a Odoo: {e}")
+        return ConversationHandler.END
+
+    prods = _buscar_producto_odoo(models, uid, nombre_prod)
+    if not prods:
+        await update.message.reply_text(f"📭 No encontré ningún producto con '{nombre_prod}'.")
+        return ConversationHandler.END
+
+    locs = _buscar_ubicacion_odoo(models, uid, nombre_dest)
+    if not locs:
+        await update.message.reply_text(f"📭 No encontré la ubicación '{nombre_dest}'.")
+        return ConversationHandler.END
+
+    prod = prods[0]
+    loc = locs[0]
+    aviso = ""
+    if len(prods) > 1:
+        otros = ", ".join(p["name"] for p in prods[1:4])
+        aviso = f"\n(Encontré varios: usaré *{prod['name']}*. Otros: {otros})"
+
     context.user_data["movi"] = {
-        "product_id": int(args[0]),
-        "location_dest_id": int(args[1]),
-        "product_uom_qty": float(args[2]),
+        "product_id": prod["id"],
+        "location_dest_id": loc["id"],
+        "product_uom_qty": cantidad,
+        "product_uom": prod["uom_id"][0] if isinstance(prod.get("uom_id"), list) else 1,
+        "desc": (f"Producto: *{prod['name']}* (hay {prod.get('qty_available', 0)} uds)\n"
+                 f"Destino: *{loc['name']}*\nCantidad: *{cantidad}*"),
     }
     await update.message.reply_text(
-        f"⚠️ ¿Registrar movimiento?\n"
-        f"Producto: {args[0]} | Destino: {args[1]} | Cantidad: {args[2]}\n"
+        f"⚠️ ¿Lo registro?\n{context.user_data['movi']['desc']}{aviso}\n\n"
         f"Responde: *sí* para confirmar o *no* para cancelar.",
         parse_mode="Markdown",
     )
@@ -329,7 +523,7 @@ async def movi_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "location_id": 1,
                 "location_dest_id": datos["location_dest_id"],
                 "product_uom_qty": datos["product_uom_qty"],
-                "product_uom": 1,
+                "product_uom": datos.get("product_uom", 1),
             }]]
         )
         models.execute_kw(ODOO_DB, uid, ODOO_PASS, "stock.move", "action_done", [[move_id]])
@@ -344,6 +538,15 @@ async def movi_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def movi_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("❌ Movimiento cancelado.")
     return ConversationHandler.END
+
+
+async def cmd_comparativo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(comparativo_mes(), parse_mode="Markdown")
+
+
+async def cmd_cierre(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    fecha = context.args[0] if context.args else "hoy"
+    await update.message.reply_text(cierre_caja(fecha), parse_mode="Markdown")
 
 
 # ─── SISTEMA DE PENDIENTES ───────────────────────────────────────────────────
@@ -452,6 +655,37 @@ async def mensaje_libre(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     upper = texto.strip().upper()
     palabras = texto.strip().split()
+
+    # ─── Confirmación pendiente de MOVI (sí/no) ────────────────────────────
+    if context.user_data.get("movi") and upper in ("SÍ", "SI", "YES", "NO"):
+        await movi_confirm(update, context)
+        return
+
+    # ─── Detectar COMPARATIVO (antes que CORTE: "compara ventas..." tiene VENTAS) ───
+    if ("COMPARATIVO" in upper or "CÓMO VOY" in upper or "COMO VOY" in upper
+            or ("VS" in upper and ("AÑO" in upper or "PASADO" in upper))):
+        await update.message.reply_text(comparativo_mes(), parse_mode="Markdown")
+        return
+
+    # ─── Detectar CIERRE DE CAJA (también antes que CORTE) ────────────────
+    if "CIERRE" in upper:
+        fecha = "hoy"
+        for p in palabras:
+            p_upper = p.upper()
+            if p_upper in ("HOY", "AYER"):
+                fecha = p.lower()
+                break
+            if re.match(r"^\d{4}-\d{2}-\d{2}$", p):
+                fecha = p
+                break
+        await update.message.reply_text(cierre_caja(fecha), parse_mode="Markdown")
+        return
+
+    # ─── Detectar MOVI en lenguaje natural (mueve/pasa/traslada) ──────────
+    if any(upper.startswith(k) for k in ["MUEVE ", "MOVER ", "PASA ", "TRASLADA ", "MOVI "]):
+        context.args = palabras[1:]
+        await cmd_movi(update, context)
+        return
 
     # ─── Detectar CORTE / VENTAS ───────────────────────────────────────────
     if any(k in upper for k in ["CORTE", "VENTAS", "VENTA"]):
@@ -574,6 +808,8 @@ def main():
     application.add_handler(CommandHandler("agrega", cmd_agrega_pendiente))
     application.add_handler(CommandHandler("quitar", cmd_quitar_pendiente))
     application.add_handler(CommandHandler("ya_termine", cmd_ya_termine))
+    application.add_handler(CommandHandler("comparativo", cmd_comparativo))
+    application.add_handler(CommandHandler("cierre", cmd_cierre))
 
     # Conversación MOVI
     movi_conv = ConversationHandler(
