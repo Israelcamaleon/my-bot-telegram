@@ -113,7 +113,9 @@ def mapa_sucursales(models, uid, orders: List[Dict[str, Any]]) -> Dict[int, str]
         for s in sessions:
             cfg = s.get("config_id")
             nombre = cfg[1] if isinstance(cfg, list) else "?"
-            mapa_ses[s["id"]] = nombre.replace(" (no usado)", "")
+            # Quitar cualquier sufijo entre paréntesis: " (no usado)", " (98 Recepcion...)", etc.
+            nombre = re.sub(r"\s*\(.*?\)", "", nombre).strip()
+            mapa_ses[s["id"]] = nombre
     resultado = {}
     for o in orders:
         ses = o.get("session_id")
@@ -888,6 +890,11 @@ async def mensaje_libre(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(comparativo_mes(), parse_mode="Markdown")
         return
 
+    # ─── Reporte manual (ventas ayer + pendientes) ─────────────────────────
+    if upper in ("REPORTE", "RESUMEN", "BUENOS DÍAS", "BUENOS DIAS"):
+        await cmd_reporte(update, context)
+        return
+
     # ─── Detectar CIERRE DE CAJA (también antes que CORTE) ────────────────
     if "CIERRE" in upper:
         fecha = "hoy"
@@ -1023,15 +1030,62 @@ async def mensaje_libre(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ─── Reporte automático 9:00 AM ──────────────────────────────────────────────
+def quitar_markdown(texto: str) -> str:
+    """Quita caracteres de Markdown para enviar texto plano sin errores."""
+    return texto.replace("*", "").replace("_", "").replace("`", "")
+
+
+def resumen_pendientes_texto() -> str:
+    """Texto plano con los pendientes activos de todas las listas."""
+    data = cargar_pendientes()
+    lineas = []
+    for nombre, items in sorted(data.items()):
+        activos = [p for p in items if not p.get("hecho")]
+        if not activos:
+            continue
+        lineas.append(f"🗂️ {nombre}:")
+        for p in activos:
+            lineas.append(f"   ⬜ {p['texto']}")
+    if not lineas:
+        return "📋 Sin pendientes activos. ¡Todo al día! 🎉"
+    total = sum(1 for items in data.values() for p in items if not p.get("hecho"))
+    return f"📋 Tienes {total} pendiente(s) activo(s):\n" + "\n".join(lineas)
+
+
+def construir_reporte() -> str:
+    """Arma el reporte matutino: ventas de ayer + pendientes. Texto plano."""
+    ayer = (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d")
+    partes = [f"☀️ Buenos días, Israel — reporte de ayer ({ayer})"]
+
+    try:
+        ventas = consultar_ventas(ayer)
+    except Exception as e:
+        logger.error(f"Reporte: error ventas: {e}")
+        ventas = f"❌ No pude consultar las ventas: {e}"
+    partes.append(quitar_markdown(ventas))
+
+    try:
+        pendientes = resumen_pendientes_texto()
+    except Exception as e:
+        logger.error(f"Reporte: error pendientes: {e}")
+        pendientes = f"❌ No pude leer los pendientes: {e}"
+    partes.append(pendientes)
+
+    return "\n\n".join(partes)
+
+
 async def reporte_diario(context: ContextTypes.DEFAULT_TYPE):
     logger.info("Enviando reporte diario 9 AM")
-    ayer = (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d")
-    texto = consultar_ventas(ayer)
-    await context.bot.send_message(
-        chat_id=OWNER_CHAT_ID,
-        text=f"📊 *Reporte automático — {ayer}*\n\n{texto}",
-        parse_mode="Markdown",
-    )
+    try:
+        await context.bot.send_message(chat_id=OWNER_CHAT_ID, text=construir_reporte())
+        logger.info("Reporte diario enviado OK")
+    except Exception as e:
+        logger.error(f"❌ Falló el envío del reporte diario: {e}")
+
+
+async def cmd_reporte(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Comando manual: manda el mismo reporte de las 9 AM cuando se pida."""
+    await update.message.reply_text(construir_reporte())
 
 
 # ─── Main ────────────────────────────────────────────────────────────────────
@@ -1056,6 +1110,7 @@ def main():
     application.add_handler(CommandHandler("listas", cmd_listas))
     application.add_handler(CommandHandler("nueva_lista", cmd_nueva_lista))
     application.add_handler(CommandHandler("borrar_lista", cmd_borrar_lista))
+    application.add_handler(CommandHandler("reporte", cmd_reporte))
 
     # Conversación MOVI
     movi_conv = ConversationHandler(
@@ -1073,6 +1128,7 @@ def main():
     # JobQueue: reporte 9:00 AM hora México (UTC-6 → 15:00 UTC)
     job_queue = application.job_queue
     job_queue.run_daily(reporte_diario, time=dt_time(hour=15, minute=0))
+    logger.info("Reporte diario programado: 9:00 AM hora México (15:00 UTC)")
 
     logger.info("Bot iniciado. Esperando mensajes...")
     application.run_polling(allowed_updates=Update.ALL_TYPES)
