@@ -36,10 +36,15 @@ ODOO_PASS = "Alika5835"
 
 OWNER_CHAT_ID = 8774793380  # ID real de Israel (verificado con comando MI ID, 13-ago-2026)
 
-# Si Railway tiene un Volume montado en /data, úsalo (sobrevive a despliegues).
-# Si no, usa el archivo local (se borra en cada deploy).
-DATA_DIR = "/data" if os.path.isdir("/data") else "."
-PENDIENTES_FILE = os.path.join(DATA_DIR, "pendientes.json")
+# ─── Persistencia de pendientes ──────────────────────────────────────────────
+# Railway borra el disco en cada deploy y esta cuenta no tiene Volumes.
+# Solución: los pendientes viven en un repo PRIVADO aparte en GitHub
+# (Israelcamaleon/bot-data). El archivo local solo es caché/respaldo.
+PENDIENTES_FILE = "pendientes.json"
+GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN", "")
+GITHUB_USER = "Israelcamaleon"
+GITHUB_DATA_REPO = f"{GITHUB_USER}/bot-data"
+GITHUB_API = "https://api.github.com"
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -48,6 +53,92 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # ─── Persistencia de pendientes ──────────────────────────────────────────────
+def _gh_headers() -> Dict[str, str]:
+    return {
+        "Authorization": f"Bearer {GITHUB_TOKEN}",
+        "Accept": "application/vnd.github+json",
+    }
+
+
+def _asegurar_repo_datos():
+    """Crea el repo privado bot-data si no existe."""
+    try:
+        r = httpx.get(f"{GITHUB_API}/repos/{GITHUB_DATA_REPO}", headers=_gh_headers(), timeout=15)
+        if r.status_code == 200:
+            return True
+        r = httpx.post(
+            f"{GITHUB_API}/user/repos",
+            headers=_gh_headers(),
+            json={"name": "bot-data", "private": True, "description": "Datos del bot (pendientes)"},
+            timeout=15,
+        )
+        logger.info(f"Repo bot-data creado: {r.status_code}")
+        return r.status_code in (200, 201)
+    except Exception as e:
+        logger.error(f"Error asegurando repo de datos: {e}")
+        return False
+
+
+def _cargar_de_github() -> Dict[str, List[Dict[str, Any]]]:
+    """Descarga pendientes.json del repo de datos. None si no hay."""
+    import base64
+    r = httpx.get(
+        f"{GITHUB_API}/repos/{GITHUB_DATA_REPO}/contents/pendientes.json",
+        headers=_gh_headers(), timeout=15,
+    )
+    if r.status_code != 200:
+        return None
+    contenido = base64.b64decode(r.json()["content"]).decode("utf-8")
+    return json.loads(contenido)
+
+
+def _guardar_en_github(data: Dict[str, List[Dict[str, Any]]]):
+    """Sube pendientes.json al repo de datos (crea o actualiza)."""
+    import base64
+    url = f"{GITHUB_API}/repos/{GITHUB_DATA_REPO}/contents/pendientes.json"
+    sha = None
+    r = httpx.get(url, headers=_gh_headers(), timeout=15)
+    if r.status_code == 200:
+        sha = r.json().get("sha")
+    payload = {
+        "message": "Update pendientes.json",
+        "content": base64.b64encode(json.dumps(data, ensure_ascii=False, indent=2).encode("utf-8")).decode("ascii"),
+    }
+    if sha:
+        payload["sha"] = sha
+    r = httpx.put(url, headers=_gh_headers(), json=payload, timeout=15)
+    if r.status_code not in (200, 201):
+        logger.error(f"GitHub respondió {r.status_code} al guardar pendientes: {r.text[:200]}")
+
+
+def _normalizar_data(data) -> Dict[str, List[Dict[str, Any]]]:
+    """Migra formato viejo (lista plana) a diccionario de listas."""
+    if isinstance(data, list):
+        data = {"general": data}
+    if not isinstance(data, dict):
+        data = {}
+    if "general" not in data:
+        data["general"] = []
+    return data
+
+
+def sincronizar_pendientes():
+    """Al arrancar: baja los pendientes de GitHub al caché local."""
+    if not GITHUB_TOKEN:
+        return
+    try:
+        if not _asegurar_repo_datos():
+            return
+        data = _cargar_de_github()
+        if data is not None:
+            data = _normalizar_data(data)
+            with open(PENDIENTES_FILE, "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+            logger.info("Pendientes sincronizados desde GitHub")
+    except Exception as e:
+        logger.error(f"Error sincronizando pendientes: {e}")
+
+
 def cargar_pendientes() -> Dict[str, List[Dict[str, Any]]]:
     """
     Carga las listas de pendientes: {"general": [...], "compras": [...], ...}
@@ -58,17 +149,17 @@ def cargar_pendientes() -> Dict[str, List[Dict[str, Any]]]:
             data = json.load(f)
     except (FileNotFoundError, json.JSONDecodeError):
         return {"general": []}
-
-    if isinstance(data, list):  # formato viejo → migrar
-        data = {"general": data}
-    if "general" not in data:
-        data["general"] = []
-    return data
+    return _normalizar_data(data)
 
 
 def guardar_pendientes(data: Dict[str, List[Dict[str, Any]]]):
     with open(PENDIENTES_FILE, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
+    if GITHUB_TOKEN:
+        try:
+            _guardar_en_github(data)
+        except Exception as e:
+            logger.error(f"Error guardando pendientes en GitHub: {e}")
 
 
 def normalizar_lista(nombre: str) -> str:
@@ -1100,6 +1191,7 @@ async def cmd_reporte(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def al_iniciar(application):
     """Aviso de arranque: confirma que el bot está vivo y el reporte programado."""
     try:
+        sincronizar_pendientes()
         await application.bot.send_message(
             chat_id=OWNER_CHAT_ID,
             text="🔄 Bot reiniciado y funcionando.\n"
