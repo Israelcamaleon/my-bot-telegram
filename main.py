@@ -34,7 +34,7 @@ ODOO_DB   = "alika_salon"
 ODOO_USER = "israel.becerril@alika.com.mx"
 ODOO_PASS = "Alika5835"
 
-OWNER_CHAT_ID = 1000342482
+OWNER_CHAT_ID = 8774793380  # ID real de Israel (verificado con comando MI ID, 13-ago-2026)
 
 # Si Railway tiene un Volume montado en /data, úsalo (sobrevive a despliegues).
 # Si no, usa el archivo local (se borra en cada deploy).
