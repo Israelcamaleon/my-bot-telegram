@@ -1089,8 +1089,27 @@ async def cmd_reporte(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ─── Main ────────────────────────────────────────────────────────────────────
+async def al_iniciar(application):
+    """Aviso de arranque: confirma que el bot está vivo y el reporte programado."""
+    try:
+        await application.bot.send_message(
+            chat_id=OWNER_CHAT_ID,
+            text="🔄 Bot reiniciado y funcionando.\n"
+                 "⏰ Reporte diario programado: 9:00 AM (ventas de ayer + pendientes).\n"
+                 "Prueba manual: escribe REPORTE",
+        )
+        logger.info("Mensaje de arranque enviado al dueño")
+    except Exception as e:
+        logger.error(f"❌ No pude enviar mensaje de arranque: {e}")
+
+
 def main():
-    application = Application.builder().token(TELEGRAM_TOKEN).build()
+    application = (
+        Application.builder()
+        .token(TELEGRAM_TOKEN)
+        .post_init(al_iniciar)
+        .build()
+    )
 
     # Borrar webhook por si quedó activo (evita Conflict)
     asyncio.get_event_loop().run_until_complete(application.bot.delete_webhook(drop_pending_updates=True))
