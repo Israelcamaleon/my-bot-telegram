@@ -852,7 +852,8 @@ async def cmd_agrega_pendiente(update: Update, context: ContextTypes.DEFAULT_TYP
         return
 
     nombre = "general"
-    m = re.match(r"(?i)^a\s+([^:]+?):\s*(.+)$", texto)
+    # Acepta con o sin dos puntos: "a casa/despensa: leche" o "a casa/despensa leche"
+    m = re.match(r"(?i)^a\s+([^\s:]+)\s*:?\s+(.+)$", texto)
     if m:
         nombre = normalizar_lista(m.group(1))
         texto = m.group(2).strip()
