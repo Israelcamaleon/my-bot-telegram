@@ -890,6 +890,14 @@ async def mensaje_libre(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(comparativo_mes(), parse_mode="Markdown")
         return
 
+    # ─── Diagnóstico: mostrar el chat_id real del usuario ──────────────────
+    if upper in ("MI ID", "MIID", "ID"):
+        await update.message.reply_text(
+            f"Tu chat ID es: {update.message.chat_id}\n"
+            f"El bot tiene guardado: {OWNER_CHAT_ID}"
+        )
+        return
+
     # ─── Reporte manual (ventas ayer + pendientes) ─────────────────────────
     if upper in ("REPORTE", "RESUMEN", "BUENOS DÍAS", "BUENOS DIAS"):
         await cmd_reporte(update, context)
